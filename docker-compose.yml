@@ -1,0 +1,12 @@
+services:
+  miron-tracker:
+    build: .
+    container_name: miron-tracker
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./miron_tracker.db:/app/miron_tracker.db
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DATABASE_PATH: /app/miron_tracker.db
