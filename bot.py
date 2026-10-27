@@ -7,7 +7,7 @@ import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, time, timedelta
-from typing import Iterator
+from typing import Iterator, Literal
 
 import pytz
 from dotenv import load_dotenv
@@ -25,6 +25,8 @@ if not BOT_TOKEN:
 DATABASE_PATH = os.getenv("DATABASE_PATH", "miron_tracker.db")
 TIMEZONE = pytz.timezone(os.getenv("TIMEZONE", "Europe/Tallinn"))
 ML_INPUT_TIMEOUT_SECONDS = 5 * 60
+ActivityType = Literal["sleep", "walk"]
+ACTIVE_ACTIVITY_TYPES: tuple[ActivityType, ...] = ("sleep", "walk")
 
 
 def parse_user_ids(env_name: str) -> set[int]:
@@ -129,6 +131,56 @@ def set_current_state(key: str, value: str):
 def delete_current_state(key: str):
     with database_connection() as conn:
         conn.execute("DELETE FROM state WHERE key = ?", (key,))
+
+
+def start_activity(activity_type: ActivityType, start_time: float) -> ActivityType | None:
+    if activity_type not in ACTIVE_ACTIVITY_TYPES:
+        raise ValueError(f"Неизвестный тип активности: {activity_type}")
+
+    with database_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        for active_type in ACTIVE_ACTIVITY_TYPES:
+            row = conn.execute(
+                "SELECT 1 FROM state WHERE key = ?",
+                (f"{active_type}_start",),
+            ).fetchone()
+            if row:
+                return active_type
+        conn.execute(
+            "INSERT INTO state (key, value) VALUES (?, ?)",
+            (f"{activity_type}_start", str(start_time)),
+        )
+    return None
+
+
+def finish_activity(
+    activity_type: ActivityType,
+    end_time: float,
+) -> tuple[float, int] | None:
+    if activity_type not in ACTIVE_ACTIVITY_TYPES:
+        raise ValueError(f"Неизвестный тип активности: {activity_type}")
+
+    state_key = f"{activity_type}_start"
+    with database_connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT value FROM state WHERE key = ?",
+            (state_key,),
+        ).fetchone()
+        if row is None:
+            return None
+
+        start_time = parse_stored_time(row[0])
+        duration_minutes = int(max(0, (end_time - start_time) // 60))
+        conn.execute(
+            """
+            INSERT INTO events (event_type, start_time, end_time, details)
+            VALUES (?, ?, ?, ?)
+            """,
+            (activity_type, start_time, end_time, str(duration_minutes)),
+        )
+        conn.execute("DELETE FROM state WHERE key = ?", (state_key,))
+    return start_time, duration_minutes
 
 
 def waiting_key(chat_id: int) -> str:
@@ -434,68 +486,62 @@ async def cmd_refresh(message: Message):
 @dp.message(F.text == "💤 Уложить спать")
 async def cmd_go_to_sleep(message: Message):
     clear_waiting_for_ml(message.chat.id)
-    if get_current_state("sleep_start"):
-        await message.answer("Мирон уже спит. Нажмите «⏰ Проснулся», чтобы завершить сон.")
-        return
-    if get_current_state("walk_start"):
-        await message.answer("Сначала завершите прогулку кнопкой «🏠 Вернулись с прогулки».")
-        return
     now_ts = get_now_timestamp()
-    set_current_state("sleep_start", str(now_ts))
+    active_activity = start_activity("sleep", now_ts)
+    if active_activity is not None:
+        if active_activity == "sleep":
+            await message.answer("Мирон уже спит. Нажмите «⏰ Проснулся», чтобы завершить сон.")
+        else:
+            await message.answer("Сначала завершите прогулку кнопкой «🏠 Вернулись с прогулки».")
+        return
     await message.answer(f"🌙 <b>{timestamp_to_str(now_ts)}</b> — Мирон уснул.", parse_mode="HTML")
     await message.answer(text=build_dashboard_text(), reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 @dp.message(F.text == "⏰ Проснулся")
 async def cmd_wake_up(message: Message):
     clear_waiting_for_ml(message.chat.id)
-    sleep_start = get_current_state("sleep_start")
-    if sleep_start:
-        now_ts = get_now_timestamp()
-        try:
-            start_ts = parse_stored_time(sleep_start)
-            duration_mins = int(max(0, (now_ts - start_ts) // 60))
-            log_event(event_type="sleep", start_time=start_ts, end_time=now_ts, details=str(duration_mins))
-            delete_current_state("sleep_start")
+    now_ts = get_now_timestamp()
+    try:
+        finished_activity = finish_activity("sleep", now_ts)
+        if finished_activity is not None:
+            _, duration_mins = finished_activity
             await message.answer(text=f"☀️ <b>{timestamp_to_str(now_ts)}</b> — Мирон проснулся. Поспал: <b>{duration_mins // 60}ч {duration_mins % 60}мин</b>.", parse_mode="HTML")
-        except (TypeError, ValueError, OverflowError):
-            logger.exception("Не удалось завершить сон")
-            await message.answer("Не удалось обработать время сна. Статус сохранен; попробуйте обновить его позже.")
-    else:
-        await message.answer("Ошибка: Старт сна не найден в базе.")
+        else:
+            await message.answer("Ошибка: Старт сна не найден в базе.")
+    except (TypeError, ValueError, OverflowError):
+        logger.exception("Не удалось завершить сон")
+        await message.answer("Не удалось обработать время сна. Статус сохранен; попробуйте обновить его позже.")
     await message.answer(text=build_dashboard_text(), reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 # --- ПРОГУЛКА ---
 @dp.message(F.text == "🌳 Пошли гулять")
 async def cmd_walk_start(message: Message):
     clear_waiting_for_ml(message.chat.id)
-    if get_current_state("walk_start"):
-        await message.answer("Мирон уже гуляет. Нажмите «🏠 Вернулись с прогулки», чтобы завершить прогулку.")
-        return
-    if get_current_state("sleep_start"):
-        await message.answer("Сначала завершите сон кнопкой «⏰ Проснулся».")
-        return
     now_ts = get_now_timestamp()
-    set_current_state("walk_start", str(now_ts))
+    active_activity = start_activity("walk", now_ts)
+    if active_activity is not None:
+        if active_activity == "walk":
+            await message.answer("Мирон уже гуляет. Нажмите «🏠 Вернулись с прогулки», чтобы завершить прогулку.")
+        else:
+            await message.answer("Сначала завершите сон кнопкой «⏰ Проснулся».")
+        return
     await message.answer(f"🌳 <b>{timestamp_to_str(now_ts)}</b> — Пошли гулять.", parse_mode="HTML")
     await message.answer(text=build_dashboard_text(), reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 @dp.message(F.text == "🏠 Вернулись с прогулки")
 async def cmd_walk_end(message: Message):
     clear_waiting_for_ml(message.chat.id)
-    walk_start = get_current_state("walk_start")
-    if walk_start:
-        now_ts = get_now_timestamp()
-        try:
-            start_ts = parse_stored_time(walk_start)
-            duration_mins = int(max(0, (now_ts - start_ts) // 60))
-            log_event(event_type="walk", start_time=start_ts, end_time=now_ts, details=str(duration_mins))
-            delete_current_state("walk_start")
+    now_ts = get_now_timestamp()
+    try:
+        finished_activity = finish_activity("walk", now_ts)
+        if finished_activity is not None:
+            _, duration_mins = finished_activity
             await message.answer(text=f"🏠 <b>{timestamp_to_str(now_ts)}</b> — Вернулись домой. Гуляли: <b>{duration_mins // 60}ч {duration_mins % 60}мин</b>.", parse_mode="HTML")
-        except (TypeError, ValueError, OverflowError):
-            logger.exception("Не удалось завершить прогулку")
-            await message.answer("Не удалось обработать время прогулки. Статус сохранен; попробуйте обновить его позже.")
-    else:
-        await message.answer("Ошибка: Время начала прогулки не найдено.")
+        else:
+            await message.answer("Ошибка: Время начала прогулки не найдено.")
+    except (TypeError, ValueError, OverflowError):
+        logger.exception("Не удалось завершить прогулку")
+        await message.answer("Не удалось обработать время прогулки. Статус сохранен; попробуйте обновить его позже.")
     await message.answer(text=build_dashboard_text(), reply_markup=get_main_keyboard(), parse_mode="HTML")
 
 # --- ПОДГУЗНИК ---

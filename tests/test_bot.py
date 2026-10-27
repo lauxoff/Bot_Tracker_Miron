@@ -1,7 +1,9 @@
 import json
 import os
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 os.environ["BOT_TOKEN"] = "123456789:TESTTOKEN"
@@ -12,6 +14,16 @@ import bot
 
 
 class FeedingInputTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.old_database_path = bot.DATABASE_PATH
+        bot.DATABASE_PATH = os.path.join(self.temp_dir.name, "tracker.db")
+        bot.init_db()
+
+    def tearDown(self):
+        bot.DATABASE_PATH = self.old_database_path
+        self.temp_dir.cleanup()
+
     def test_accepts_only_a_single_valid_amount(self):
         for text, expected in (
             ("120", 120),
@@ -116,3 +128,55 @@ class EventReportingTests(unittest.TestCase):
         start, end = bot.today_bounds(now)
         self.assertEqual(datetime.fromtimestamp(start, bot.TIMEZONE).date(), now.date())
         self.assertEqual(datetime.fromtimestamp(end, bot.TIMEZONE).date(), now.date() + timedelta(days=1))
+
+
+class ActivityTransitionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.old_database_path = bot.DATABASE_PATH
+        bot.DATABASE_PATH = os.path.join(self.temp_dir.name, "tracker.db")
+        bot.init_db()
+
+    def tearDown(self):
+        bot.DATABASE_PATH = self.old_database_path
+        self.temp_dir.cleanup()
+
+    def test_only_one_activity_can_start_when_commands_arrive_concurrently(self):
+        barrier = threading.Barrier(2)
+
+        def start(activity):
+            barrier.wait()
+            return bot.start_activity(activity, start_time=1000)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(start, ("sleep", "walk")))
+
+        self.assertEqual(results.count(None), 1)
+        self.assertEqual(len([result for result in results if result is not None]), 1)
+        with bot.database_connection() as conn:
+            active_states = conn.execute(
+                "SELECT key FROM state WHERE key IN ('sleep_start', 'walk_start')"
+            ).fetchall()
+        self.assertEqual(len(active_states), 1)
+
+    def test_finishing_an_activity_is_atomic_and_idempotent(self):
+        bot.start_activity("sleep", start_time=1000)
+
+        self.assertEqual(bot.finish_activity("sleep", end_time=1300), (1000.0, 5))
+        self.assertIsNone(bot.finish_activity("sleep", end_time=1300))
+        with bot.database_connection() as conn:
+            events = conn.execute(
+                "SELECT event_type, start_time, end_time, details FROM events"
+            ).fetchall()
+        self.assertEqual(events, [("sleep", 1000.0, 1300, "5")])
+        self.assertIsNone(bot.get_current_state("sleep_start"))
+
+    def test_invalid_start_time_does_not_clear_activity_or_create_event(self):
+        bot.set_current_state("sleep_start", "invalid")
+
+        with self.assertRaises(ValueError):
+            bot.finish_activity("sleep", end_time=1300)
+
+        self.assertEqual(bot.get_current_state("sleep_start"), "invalid")
+        with bot.database_connection() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM events").fetchone()[0], 0)
